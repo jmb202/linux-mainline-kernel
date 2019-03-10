@@ -91,7 +91,7 @@
 	};
 
 	edp_panel: edp-panel {
-		compatible = "simple-panel";
+		compatible = "innolux,n116hse-ea1", "simple-panel";
 		backlight = <&backlight>;
 		power-supply = <&vcc3v3_s0>;
 
