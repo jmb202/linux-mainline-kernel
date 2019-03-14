@@ -308,10 +308,23 @@
 };
 
 &hdmi {
-	ddc-i2c-bus = <&i2c3>;
-	pinctrl-names = "default";
-	pinctrl-0 = <&hdmi_cec>;
 	status = "okay";
+	ddc-i2c-bus = <&i2c3>;
+	/*
+	 * The HDMI CEC controller shares a pad with
+	 * eDP hotplug detection. It is not possible
+	 * to use both at the same time so, as CEC is
+	 * is (theoretically) optional, disable it here
+	 * by overriding the clock configuration.
+	 *
+	 * pinctrl-names = "default";
+	 * pinctrl-0 = <&hdmi_cec>;
+	 */
+	clocks = <&cru PCLK_HDMI_CTRL>,
+		 <&cru SCLK_HDMI_SFR>,
+		 <&cru PLL_VPLL>,
+		 <&cru PCLK_VIO_GRF>;
+	clock-names = "iahb", "isfr", "vpll", "grf";
 };
 
 &gpu {
