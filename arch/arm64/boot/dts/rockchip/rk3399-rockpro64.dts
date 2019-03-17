@@ -592,8 +592,6 @@
 		reg = <0x11>;
 		clocks = <&cru SCLK_I2S_8CH_OUT>;
 		clock-names = "mclk";
-		pinctrl-names = "default";
-		pinctrl-0 = <&i2s_8ch_mclk>;
 		hp-det-gpio = <&gpio0 RK_PB0 GPIO_ACTIVE_LOW>;
 	};
 };
@@ -611,26 +609,10 @@
 };
 
 &i2s0 {
-	pinctrl-0 = <&i2s0_8ch_bus>;
 	rockchip,playback-channels = <8>;
 	rockchip,capture-channels = <8>;
 	#sound-dai-cells = <0>;
 	status = "okay";
-};
-
-/* Redefine i2s0_8ch_bus to avoid conflict with i2s_8ch_mclk
- * (which is used by es8316 and not exposed on the PI-2 header
- * for use with the rest of the i2s0 bus) */
-&i2s0_8ch_bus {
-	rockchip,pins =
-		<3 24 RK_FUNC_1 &pcfg_pull_none>,
-		<3 25 RK_FUNC_1 &pcfg_pull_none>,
-		<3 26 RK_FUNC_1 &pcfg_pull_none>,
-		<3 27 RK_FUNC_1 &pcfg_pull_none>,
-		<3 28 RK_FUNC_1 &pcfg_pull_none>,
-		<3 29 RK_FUNC_1 &pcfg_pull_none>,
-		<3 30 RK_FUNC_1 &pcfg_pull_none>,
-		<3 31 RK_FUNC_1 &pcfg_pull_none>;
 };
 
 &i2s1 {
