@@ -12,10 +12,13 @@
 
 #include <linux/module.h>
 #include <linux/acpi.h>
+#include <linux/clk.h>
+#include <linux/clkdev.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
+#include <linux/of_gpio.h>
 #include <linux/regmap.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -40,6 +43,7 @@ struct es8316_priv {
 	struct snd_soc_component *component;
 	struct snd_soc_jack *jack;
 	int irq;
+	struct clk *mclk;
 	unsigned int sysclk;
 	unsigned int allowed_rates[NR_SUPPORTED_MCLK_LRCK_RATIOS];
 	struct snd_pcm_hw_constraint_list sysclk_constraints;
@@ -365,6 +369,18 @@ static int es8316_set_dai_sysclk(struct snd_soc_dai *codec_dai,
 	int i;
 	int count = 0;
 
+	dev_info(component->dev, "Setting sysclk id=%d freq=%u dir=%d current=%u\n",
+		 clk_id, freq, dir, es8316->sysclk);
+
+	if (freq == es8316->sysclk)
+		return 0;
+
+	if (!IS_ERR(es8316->mclk)) {
+		freq = clk_round_rate(es8316->mclk, freq);
+		clk_set_rate(es8316->mclk, freq);
+		dev_info(component->dev, "Rounded freq=%u\n", freq);
+	}
+
 	es8316->sysclk = freq;
 
 	if (freq == 0)
@@ -443,17 +459,14 @@ static int es8316_pcm_startup(struct snd_pcm_substream *substream,
 	struct snd_soc_component *component = dai->component;
 	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
 
-	if (es8316->sysclk == 0) {
-		dev_err(component->dev, "No sysclk provided\n");
-		return -EINVAL;
+	if (es8316->sysclk != 0 && es8316->sysclk_constraints.count != 0) {
+		/* The set of sample rates that can be supported depends on the
+		 * MCLK supplied to the CODEC.
+		 */
+		snd_pcm_hw_constraint_list(substream->runtime, 0,
+					   SNDRV_PCM_HW_PARAM_RATE,
+					   &es8316->sysclk_constraints);
 	}
-
-	/* The set of sample rates that can be supported depends on the
-	 * MCLK supplied to the CODEC.
-	 */
-	snd_pcm_hw_constraint_list(substream->runtime, 0,
-				   SNDRV_PCM_HW_PARAM_RATE,
-				   &es8316->sysclk_constraints);
 
 	return 0;
 }
@@ -577,7 +590,7 @@ static irqreturn_t es8316_irq(int irq, void *data)
 	if (!es8316->jack)
 		goto out;
 
-	dev_dbg(comp->dev, "gpio flags %#04x\n", flags);
+	dev_info(comp->dev, "gpio flags %#04x\n", flags);
 	if (flags & ES8316_GPIO_FLAG_HP_NOT_INSERTED) {
 		/* Jack removed, or spurious IRQ? */
 		if (es8316->jack->status & SND_JACK_MICROPHONE)
@@ -586,13 +599,14 @@ static irqreturn_t es8316_irq(int irq, void *data)
 		if (es8316->jack->status & SND_JACK_HEADPHONE) {
 			snd_soc_jack_report(es8316->jack, 0,
 					    SND_JACK_HEADSET | SND_JACK_BTN_0);
-			dev_dbg(comp->dev, "jack unplugged\n");
+			dev_info(comp->dev, "jack unplugged\n");
 		}
 	} else if (!(es8316->jack->status & SND_JACK_HEADPHONE)) {
 		/* Jack inserted, determine type */
+		dev_info(comp->dev, "jack inserted\n");
 		es8316_enable_micbias_for_mic_gnd_short_detect(comp);
 		regmap_read(es8316->regmap, ES8316_GPIO_FLAG, &flags);
-		dev_dbg(comp->dev, "gpio flags %#04x\n", flags);
+		dev_info(comp->dev, "gpio flags %#04x\n", flags);
 		if (flags & ES8316_GPIO_FLAG_HP_NOT_INSERTED) {
 			/* Jack unplugged underneath us */
 			es8316_disable_micbias_for_mic_gnd_short_detect(comp);
@@ -602,6 +616,7 @@ static irqreturn_t es8316_irq(int irq, void *data)
 					    SND_JACK_HEADSET,
 					    SND_JACK_HEADSET);
 			/* Keep mic-gnd-short detection on for button press */
+			dev_info(comp->dev, "headset\n");
 		} else {
 			/* Shorted, headphones */
 			snd_soc_jack_report(es8316->jack,
@@ -609,6 +624,7 @@ static irqreturn_t es8316_irq(int irq, void *data)
 					    SND_JACK_HEADSET);
 			/* No longer need mic-gnd-short detection */
 			es8316_disable_micbias_for_mic_gnd_short_detect(comp);
+			dev_info(comp->dev, "headphones\n");
 		}
 	} else if (es8316->jack->status & SND_JACK_MICROPHONE) {
 		/* Interrupt while jack inserted, report button state */
@@ -683,9 +699,104 @@ static int es8316_set_jack(struct snd_soc_component *component,
 	return 0;
 }
 
+static int es8316_set_bias_level(struct snd_soc_component *component,
+				 enum snd_soc_bias_level level)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+	int ret;
+
+	dev_info(component->dev, "Setting bias level %d\n", level);
+
+	switch (level) {
+	case SND_SOC_BIAS_ON:
+		break;
+	case SND_SOC_BIAS_PREPARE:
+		if (IS_ERR(es8316->mclk))
+			break;
+
+		/* Enable/disable mclk */
+		if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_ON) {
+			dev_info(component->dev, "Disabling mclk\n");
+			clk_disable_unprepare(es8316->mclk);
+		} else {
+			dev_info(component->dev, "Enabling mclk\n");
+			ret = clk_prepare_enable(es8316->mclk);
+			if (ret) {
+				dev_err(component->dev,
+					"Failed to enable mclk\n");
+				return ret;
+			}
+		}
+		break;
+	case SND_SOC_BIAS_STANDBY:
+		break;
+	case SND_SOC_BIAS_OFF:
+		break;
+	}
+
+	return 0;
+}
+
+static int es8316_suspend(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+
+	snd_soc_component_force_bias_level(component, SND_SOC_BIAS_OFF);
+	if (!IS_ERR(es8316->mclk)) {
+		dev_info(component->dev, "Disabling mclk\n");
+		clk_disable_unprepare(es8316->mclk);
+	}
+	return 0;
+}
+
+static int es8316_resume(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+	int ret;
+
+	if (!IS_ERR(es8316->mclk)) {
+		dev_info(component->dev, "Enabling mclk\n");
+		ret = clk_prepare_enable(es8316->mclk);
+		if (ret) {
+			dev_err(component->dev,
+				"Failed to enable mclk\n");
+			return ret;
+		}
+	}
+	snd_soc_component_force_bias_level(component, SND_SOC_BIAS_STANDBY);
+	return 0;
+}
+
+static void es8316_remove(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+
+	if (!IS_ERR(es8316->mclk)) {
+		dev_info(component->dev, "Disabling mclk\n");
+		clk_disable_unprepare(es8316->mclk);
+	}
+}
+
 static int es8316_probe(struct snd_soc_component *component)
 {
 	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+	int ret;
+
+	/* Check to see if mclk is provided */
+	es8316->mclk = devm_clk_get(component->dev, "mclk");
+	if (IS_ERR(es8316->mclk)) {
+		if (PTR_ERR(es8316->mclk) != -ENOENT) {
+			return PTR_ERR(es8316->mclk);
+		}
+	} else {
+		dev_info(component->dev, "Enabling mclk\n");
+		ret = clk_prepare_enable(es8316->mclk);
+		if (ret) {
+			dev_err(component->dev,
+				"Failed to enable mclk\n");
+			return ret;
+		}
+	}
 
 	es8316->component = component;
 
@@ -713,6 +824,10 @@ static int es8316_probe(struct snd_soc_component *component)
 
 static const struct snd_soc_component_driver soc_component_dev_es8316 = {
 	.probe			= es8316_probe,
+	.remove			= es8316_remove,
+	.suspend		= es8316_suspend,
+	.resume			= es8316_resume,
+	.set_bias_level         = es8316_set_bias_level,
 	.set_jack		= es8316_set_jack,
 	.controls		= es8316_snd_controls,
 	.num_controls		= ARRAY_SIZE(es8316_snd_controls),
@@ -720,6 +835,7 @@ static const struct snd_soc_component_driver soc_component_dev_es8316 = {
 	.num_dapm_widgets	= ARRAY_SIZE(es8316_dapm_widgets),
 	.dapm_routes		= es8316_dapm_routes,
 	.num_dapm_routes	= ARRAY_SIZE(es8316_dapm_routes),
+	.idle_bias_on		= 1,
 	.use_pmdown_time	= 1,
 	.endianness		= 1,
 	.non_legacy_dai_naming	= 1,
